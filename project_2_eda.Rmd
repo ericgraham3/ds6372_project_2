@@ -1,0 +1,682 @@
+---
+title: "project_2_eda"
+author: "Blake Armstrong and Eric Graham"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+# 1: Setup
+
+```{r setup, include=FALSE}
+load_or_install = function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+packages = c(
+  "tidyverse",
+  "skimr",
+  "naniar",
+  "corrplot",
+  "ggthemes",
+  "caret",
+  "knitr",
+  "car",
+  "lmboot",
+  "glmnet",
+  "randomForest"
+)
+invisible(lapply(packages, load_or_install))
+```
+
+```{r}
+df = read.csv2("bank-additional-full.csv", header = TRUE)
+names(df)
+str(df)
+head(df)
+```
+
+# 2: Exploratory Data Analysis
+
+As we see above the Bank Marketing dataset includes 41,188 rows and 21 columns. The dataset contains information about clients of a banking institution and whether they subscribed to a term deposit. To approach the question of "How can we predict whether a client will subscribe to a term deposit?" we will perform exploratory data analysis (EDA) to understand the data, identify patterns, and prepare for modeling.
+
+## Variable Classification and Basic Cleaning
+
+```{r}
+df = df %>% mutate(
+  emp.var.rate = as.numeric(emp.var.rate),
+  cons.price.idx = as.numeric(cons.price.idx),
+  cons.conf.idx = as.numeric(cons.conf.idx),
+  euribor3m = as.numeric(euribor3m),
+  nr.employed = as.numeric(nr.employed),
+  poutcome = as.factor(poutcome),
+  y = factor(y, levels = c("no", "yes")),
+  pdays_missing = pdays == 999,
+  poutcome_missing = poutcome == "nonexistent")
+str(df)
+```
+
+Aside from some basic datatype conversions, the dataset glossary shows that the value "999" designates that the client was not previously contacted. Thus, we create a new boolean variable `pdays_missing` to indicate whether the `pdays` value is 999.
+
+You would expect that this would match up with the number of "nonexistent" results on the poutcome variable, which indicates the outcome of prior marketing attempts. However, that is not the case:
+
+```{r}
+table(df$pdays_missing, df$poutcome_missing)
+```
+
+We see 4110 records for which the pdays value was 999, but the prior outcome is not flagged as "nonexistent." 
+
+```{r}
+df %>%
+  filter(pdays_missing) %>%
+  group_by(poutcome) %>%
+  summarize(count = n())
+```
+
+This is contradictory: the poutcome values here imply that the client was previously contacted, and that the attempt failed, but the pdays value indicates that the client was never contacted. This is a data quality issue that we will need to address in our analysis.
+
+```{r}
+target_var = "y"
+
+num_vars = df %>% select(where(is.numeric)) %>% names()
+num_vars = setdiff(num_vars, target_var)
+
+cat_vars = setdiff(names(df), c(num_vars, target_var))
+cat_vars
+# num_vars
+```
+
+```{r}
+# head(df)
+# glimpse(df)
+skim(df)
+```
+
+The skim() function provides a summary of the dataset, and we see no missing values. 
+
+## Variable Glossary
+
+```{r}
+data.frame(
+  Variable_Name = c(
+    "Age", "Job", "Marital", "Education", "Default", "Housing", "Loan",
+    "Contact", "Month", "Day_of_week", "Duration",
+    "Campaign", "Pdays", "Previous", "Poutcome",
+    "Emp.var.rate", "Cons.price.idx", "Cons.conf.idx",
+    "Euribor3m", "Nr.employed", "y"
+  ),
+  Description = c(
+    "Client age in years",
+    "Type of job (e.g., admin., technician, retired, etc.)",
+    "Marital status (married, single, divorced/widowed, unknown)",
+    "Education level (e.g., basic.4y, high school, university, etc.)",
+    "Has credit in default? (yes, no, unknown)",
+    "Has housing loan? (yes, no, unknown)",
+    "Has personal loan? (yes, no, unknown)",
+    "Contact communication type (cellular or telephone)",
+    "Last contact month of the year",
+    "Last contact day of the week",
+    "Last contact duration (in seconds)",
+    "Number of contacts during this campaign (includes last contact)",
+    "Days since client was last contacted (999 = not previously contacted)",
+    "Number of contacts before this campaign",
+    "Outcome of the previous marketing campaign",
+    "Employment variation rate (quarterly)",
+    "Consumer price index (monthly)",
+    "Consumer confidence index (monthly)",
+    "3-month Euribor rate (daily)",
+    "Number of employees (quarterly)",
+    "Client subscribed to a term deposit? (yes or no)"
+  ),
+  `Data Type` = c(
+    "integer", "character", "character", "character", "character", "character", "character",
+    "character", "character", "character", "integer",
+    "integer", "integer", "integer", "factor",
+    "numeric", "numeric", "numeric",
+    "numeric", "numeric", "factor"
+  ),
+  Type = c(
+    "continuous", "categorical", "categorical", "categorical", "categorical", "categorical", "categorical",
+    "categorical", "categorical", "categorical", "continuous",
+    "discrete", "discrete", "discrete", "categorical",
+    "continuous", "continuous", "continuous",
+    "continuous", "continuous", "binary"
+  )
+) |>
+  kable()
+```
+
+## Univariate Analysis
+
+```{r}
+label_dict = c(
+  "age" = "Age",
+  "job" = "Job",
+  "marital" = "Marital Status",
+  "education" = "Education",
+  "default" = "Default",
+  "housing" = "Housing Loan",
+  "loan" = "Personal Loan",
+  "contact" = "Contact Type",
+  "month" = "Month",
+  "day_of_week" = "Day of Week",
+  "duration" = "Duration",
+  "campaign" = "Campaign Contacts",
+  "pdays" = "Days Since Last Contact",
+  "previous" = "Previous Contacts",
+  "poutcome" = "Previous Outcome",
+  "emp.var.rate" = "Employment Variation Rate",
+  "cons.price.idx" = "Consumer Price Index",
+  "cons.conf.idx" = "Consumer Confidence Index",
+  "euribor3m" = "Euribor 3 Month Rate",
+  "nr.employed" = "Number of Employees",
+  "y" = "Subscribed"
+)
+
+pretty_var = function(x) {
+  gsub("_", " ", tools::toTitleCase(x))
+}
+
+get_label = function(varname) {
+  if (varname %in% names(label_dict)) {
+    return(label_dict[[varname]])
+  } else {
+    return(pretty_var(varname))
+  }
+}
+```
+
+### Distribution of Response Variable
+
+We see the overwhelming number of clients did not subscribe to a term deposit, with only about 11% of the clients subscribing. This will come as no surprise to those who have ever worked in an outbound call center.
+
+```{r}
+p = ggplot(df, aes(x = y)) +
+  geom_bar(fill = "steelblue", color = "white") +
+  labs(
+    x = "Subscribed",
+    y = "Count",
+    title = "Subscription Outcome"
+  ) +
+  theme_minimal()
+print(p)
+
+p2 = ggplot(df, aes(x = y)) +
+  geom_bar(aes(y = after_stat(prop), group = 1), fill = "steelblue", color = "white") +
+  geom_text(
+    aes(y = after_stat(prop), label = scales::percent(after_stat(prop)), group = 1),
+    stat = "count",
+    vjust = -0.5,
+    color = "black",
+    size = 4
+  ) +
+  labs(
+    x = "Subscribed",
+    y = "Proportion",
+    title = "Subscription Outcome (Proportions)"
+  ) +
+  theme_minimal()
+print(p2)
+
+```
+
+### Numeric Predictors
+
+<details>
+<summary>Click to expand: Numeric Variable Plots</summary>
+
+```{r}
+for (var in num_vars) {
+  p = ggplot(df, aes(x = !!sym(var))) +
+    geom_histogram(fill = "steelblue", color = "white") +
+    labs(
+      x = get_label(var),
+      title = paste("Distribution of", get_label(var))
+    ) +
+    theme_minimal()
+  print(p)
+}
+```
+
+```{r}
+for (var in num_vars) {
+  p = ggplot(df, aes(y = !!sym(var))) +
+    geom_boxplot(fill = "steelblue") +
+    coord_flip() +
+    labs(y = get_label(var), title = paste("Boxplot of", get_label(var))) +
+    theme_minimal()
+  print(p)
+}
+```
+
+</details>
+
+We note that age is fairly right-skewed. Duration and campaign contacts are highly right-skewed. However, duration is especially problematic in a predictive contect—the duration of the call can't be known at prediction time, so it will be excluded from Objective 2. Consumer confidence is left-skewed. 
+
+Pdays, as noted above, has a high number of 999 values, so we will be analyzing it as a boolean categorical variable rather than a numeric one.
+
+Likewise, "previous contacts" has a high number of zeroes, with few unique values; we may consider this as a factor as well.
+
+Employment Variation Rate and the Euribor 3-Month Rate may also be best handled as a "stealth" categorical variable.
+
+The number of employees has so little variance that it might not bring any explanatory or predictive power to the model.
+
+#### Transformations
+
+```{r}
+df = df %>%
+  mutate(
+    duration_log = log(duration + 1),
+    campaign_log = log(campaign + 1),
+    
+    prev_contacts_binned = case_when(
+      previous == 0 ~ "0",
+      previous == 1 ~ "1",
+      previous >= 2 ~ "2+"
+    ),
+    
+    euribor_binned = case_when(
+      euribor3m < 1 ~ "<1",
+      euribor3m >= 5 ~ "5+",
+      TRUE ~ as.character(floor(euribor3m))
+    )
+  )
+
+df = df %>%
+  mutate(
+    prev_contacts_binned = factor(prev_contacts_binned, levels = c("0", "1", "2+")),
+    euribor_binned = factor(euribor_binned, levels = c("<1", "1", "2", "3", "4", "5", "5+"))
+  )
+
+num_vars = c(num_vars, "duration_log", "campaign_log")
+cat_vars = c(cat_vars, "prev_contacts_binned", "euribor_binned")
+
+# num_vars
+# cat_vars
+
+```
+
+We binned the number of previous contacts and Euribor values, and include them with the other categorical variables.
+
+The call duration and number of contacts in the campaign may be useful for EDA and interpretive modeling, so we log-transform them to see if it addresses the skewness. 
+
+```{r}
+log_vars = c("duration_log", "campaign_log")
+
+for (var in log_vars) {
+  p = ggplot(df, aes(x = !!sym(var))) +
+    geom_histogram(fill = "steelblue", color = "white", bins = 30) +
+    labs(
+      x = get_label(var),
+      title = paste("Distribution of", get_label(var))
+    ) +
+    theme_minimal()
+  print(p)
+
+  p = ggplot(df, aes(y = !!sym(var))) +
+    geom_boxplot(fill = "steelblue") +
+    coord_flip() +
+    labs(
+      y = get_label(var),
+      title = paste("Boxplot of", get_label(var))
+    ) +
+    theme_minimal()
+  print(p)
+}
+```
+
+The log transformation appears to help a great deal with the skewness of duration, but has only a mild effect on the current campaign contacts. This may be another opportunity for binning, so we will look at a binned version of campaign contacts in the categorical analysis.
+
+```{r}
+df = df %>%
+  mutate(campaign_bin = case_when(
+    campaign == 1 ~ "1",
+    campaign %in% 2:3 ~ "2–3",
+    campaign >= 4 ~ "4+"
+  )) %>%
+  mutate(campaign_bin = factor(campaign_bin, levels = c("1", "2–3", "4+")))
+
+cat_vars = c(cat_vars, "campaign_bin")
+# cat_vars
+```
+
+
+### Categorical Variables
+
+<details>
+<summary>Click to expand: Categorical Variable Plots</summary>
+
+```{r}
+for (var in cat_vars) {
+  p = ggplot(df, aes(x = !!sym(var))) +
+    geom_bar(fill = "steelblue") +
+    labs(
+      x = get_label(var),
+      y = "Count",
+      title = paste("Frequency of", get_label(var))
+    ) +
+    theme_minimal()
+  print(p)
+}
+```
+
+</details>
+
+We note that the job variable is imbalanced, with a large number of job titles but a handful of them having a large number of clients. 
+
+The default variable includes many "no" values, a small number of "unknown" values, and only three "yes" values. This stands out as a variable with potentially little predictive power.
+
+
+```{r}
+df %>%
+  count(default)
+```
+
+Likewise, the highly imbalanced results of "previous days missing" with "previous outcome missing" is concerning, given the data quality question mentioned above. This will be something to watch closely when examining the relationship with the response variable.
+
+We note that the binning of previous campaign contacts, current campaign contacts, and Euribor 3-Month Rate has yielded a more interpretable set of categorical variables.
+
+### Outlier Analysis
+
+```{r}
+outlier_summary = data.frame()
+
+for (var in num_vars) {
+  values = df[[var]]
+  q1 = quantile(values, 0.25, na.rm = TRUE)
+  q3 = quantile(values, 0.75, na.rm = TRUE)
+  iqr = q3 - q1
+  lower = q1 - 1.5 * iqr
+  upper = q3 + 1.5 * iqr
+  outliers = sum(values < lower | values > upper, na.rm = TRUE)
+  pct = 100 * outliers / sum(!is.na(values))
+  outlier_summary = rbind(
+    outlier_summary,
+    data.frame(variable = var, num_outliers = outliers, pct_outliers = round(pct, 1))
+  )
+}
+
+outlier_summary
+```
+
+We conducted an outlier analysis across all numeric variables using IQR to identify extreme values. While some variables like duration, campaign, and previous showed moderate to high outlier proportions, we have already managed those via log transformation and binning. 
+
+## Bivariate / Multivariate Analysis
+
+### Subscriptions by Numeric Predictors
+
+<details>
+<summary>Click to expand: Numeric Bivariate Plots</summary>
+
+```{r}
+for (var in num_vars) {
+  p = ggplot(df, aes(x = !!sym(var), y = y)) +
+    geom_boxplot(aes(group = y), fill = "steelblue", alpha = 0.7) +
+    labs(
+      x = get_label(var),
+      y = "Subscribed",
+      title = paste("Subscription Outcome by", get_label(var))
+    ) +
+    theme_minimal()
+  print(p)
+}
+```
+
+</details>
+
+We note little difference between the median ages on the two subscription outcomes, leading us to think it might be a weak predictor. Likewise, number of employees (previously noted as having low variance) appears to be a weak predictor.
+
+Subscribers skew towards lower employment variation rates, leading us to think that this may be a useful predictor. Subscribers also tend to have lower consumer confidence values than non-subscribers. Lower Euribor rates are also associated with subscription. This may capture the economic conditions at the time of the marketing campaign, which could be a useful predictor, but we will assess the binned version of this variable below.
+
+We note that the log of duration is much higher among subscribers, which makes intuitive sense. As noted previously, this is not useful for predictive modeling, but it may be useful for interpretive modeling.
+
+### Subscriptions by Categorical Predictors
+
+<details>
+<summary>Click to expand: Categorical Bivariate Plots</summary>
+
+```{r}
+for (var in cat_vars) {
+  p = df %>%
+    group_by(!!sym(var)) %>%
+    summarise(prop_yes = mean(y == "yes")) %>%
+    ggplot(aes(x = !!sym(var), y = prop_yes)) +
+    geom_col(fill = "steelblue") +
+    geom_text(aes(label = scales::percent(prop_yes)), vjust = -0.5) +
+    labs(
+      x = get_label(var),
+      y = "Proportion Subscribed",
+      title = paste("Subscription Rate by", get_label(var))
+    ) +
+    theme_minimal()
+  print(p)
+}
+```
+
+</details>
+
+We note that job, marital status, education, contact type, month, day, and previous outcome all have significant differences in subscription rates, and may be useful predictors. 
+
+Clients with prior campaign contact (pdays_missing = FALSE) and a recorded previous outcome (poutcome ≠ unknown) are substantially more likely to subscribe. Due to overlap in what they convey, we may choose to retain only one: poutcome captures both the presence and outcome of prior engagement.
+
+Binning the number of previous and current campaign contacts revealed clearer patterns. Subscription rates were much lower among clients with no prior contacts, and current campaign contact counts show a declining trend, hinting at diminishing returns from repeated contact.
+
+We also see that the Euribor 3-Month Rate binned variable has a strong relationship with the response variable, with rates at either extreme having a high subscription rate. This suggests that the economic conditions at the time of the marketing campaign may be a useful predictor.
+
+As noted previously, the default variable has very few "yes" values, and the housing and loan variables also show very similar rates for all levels. These seem to have little explanatory power, and we may consider dropping them from the model. 
+
+### Multicollinearity Check
+
+```{r}
+cor_data = df %>% select(all_of(num_vars))
+
+cor_matrix = cor(cor_data, use = "complete.obs")
+
+corrplot(cor_matrix,
+         method = "color",       
+         type = "upper",         
+         order = "hclust",       
+         addCoef.col = "black",  
+         tl.cex = 0.8,           
+         number.cex = 0.7,       
+         diag = FALSE)
+```
+
+The correlation matrix shows that there is high collinearlity among our macroeconomic predictors: Euribor is highly collinear with employment, and  consumer price index is moderately correlated with both of those predictors.
+
+```{r}
+eda_vif_model = glm(
+  y ~ age + emp.var.rate + cons.price.idx + cons.conf.idx +
+      euribor3m + nr.employed + duration_log + campaign_log,
+  data = df,
+  family = binomial
+)
+vif(eda_vif_model)
+
+```
+
+A VIF analysis confirms that the employment variation rate, consumer price index, and Euribor 3-Month Rate have high VIF values, indicating multicollinearity. 
+
+# 3: Interpretive Model
+
+## Data Preparation
+
+```{r}
+set.seed(1234)
+train_proportion = 0.7
+train_indices = sample(1:nrow(df), size = floor(train_proportion * nrow(df)))
+train_df = df[train_indices, ]
+```
+
+## Feature Selection Considerations
+
+Based on exploratory data analysis, we find that duration_log, campaign_log, cons.conf.idx, euribor3m, contact, month, poutcome, job, and education are potentially useful predictors in fitting an interpretive model.
+
+The campaign_bin transformation may be more useful than the log-transformed version, as it captures the diminishing returns of repeated contacts. This is an open question, and we will test both versions in the model.
+
+Euribor 3-Month Rate is highly collinear with employment variation rate and consumer price index, so we will need to choose one of these macroeconomic predictors to include in the model. Euribor has a more direct relationship with the response in our EDA, so we will include it in the model. 
+
+There is a decision to make as to whether we prefer the binned or continuous version of euribor3m. The relationship between the binned version and the response variable is clearer in the EDA, and more interpetable, so we will use it in the interpretive model, but the numeric version may be more appropriate for the predictive model.
+
+Given the data quality issues surrounding the original pdays variable, and its redundancy with poutcome, we will not include it in the model. Instead, we will use poutcome, which offers more detailed information about prior marketing attempts without the data quality issues. We will not include the raw or binned version of previous contacts to avoid overlap, since poutcome is more informative and interpretable.
+
+```{r}
+num_vars
+# cat_vars
+```
+
+## Baseline Model (All Predictors, No Transformations)
+
+To provide a baseline for comparison, we will fit a model using all numeric and categorical predictors, excluding the problematic pdays variable. This model includes no transformations.
+
+```{r}
+baseline_model_raw = glm(
+  y ~ age + duration + campaign + pdays + previous +
+      emp.var.rate + cons.price.idx + cons.conf.idx + euribor3m + nr.employed +
+      job + marital + education + default + housing + loan +
+      contact + month + day_of_week + poutcome,
+  data = train_df,
+  family = binomial
+)
+
+summary(baseline_model_raw)
+```
+
+## Baseline Model (All Predictors, With Transformations)
+
+```{r}
+baseline_model = glm(
+  y ~ duration_log + campaign_log + cons.conf.idx + euribor_binned +
+      job + marital + education + default + housing + loan +
+      contact + month + day_of_week + poutcome +
+      pdays_missing + poutcome_missing + prev_contacts_binned + campaign_bin,
+  data = train_df,
+  family = binomial
+)
+summary(baseline_model)
+```
+
+## Feature-Selection Models
+
+### Log Transformation for Campaign
+
+```{r}
+model_campaign_log = glm(
+  y ~ duration_log + campaign_log + cons.conf.idx + euribor_binned +
+      contact + month + poutcome + job + education,
+  data = train_df,
+  family = binomial
+)
+summary(model_campaign_log)
+```
+
+### Binned Transformation for Campaign
+
+```{r, options(scipen = 999)}
+model_campaign_bin = glm(
+  y ~ duration_log + campaign_bin + cons.conf.idx + euribor_binned +
+      contact + month + poutcome + job + education,
+  data = train_df,
+  family = binomial
+)
+summary(model_campaign_bin)
+```
+
+### Try without macro
+
+```{r, options(scipen = 999)}
+model_campaign_bin_nomacro = glm(
+  y ~ duration_log + campaign_bin + 
+      contact + month + poutcome + job + education,
+  data = train_df,
+  family = binomial
+)
+summary(model_campaign_bin_nomacro)
+```
+
+### Try without duration
+
+```{r, options(scipen = 999)}
+model_campaign_noduration = glm(
+  y ~ campaign_bin + 
+      contact + month + poutcome + job + education,
+  data = train_df,
+  family = binomial
+)
+summary(model_campaign_noduration)
+```
+
+### Comparison
+
+| Model                    | Description                       | AIC    |
+|--------------------------|-----------------------------------|--------|
+| `baseline_model_raw`     | All raw variables, no EDA         | 11903  |
+| `baseline_model`         | All transformations, no feature selection   | 11405  |
+| `model_campaign_log`     | Selected vars + campaign_log      | 11413  |
+| `model_campaign_bin`     | Selected vars + campaign_bin      | 11409  |
+
+We began with a baseline logistic regression model that included all available raw predictors with no transformations or feature selection. This “kitchen sink” model achieved an AIC of 11,903. We will call this the "raw baseline model."
+
+We then fit a model with all transformed variables, which achieved an AIC of 11405. We will call this the "baseline model."
+
+Lastly, we fit a model with selected features and tranformations based on EDA and interpretability. Our trimmed, transformed model using selected predictors produced an AIC of 11,409. We will call this the "feature-selected model."
+
+While the baseline model slightly outperformed the feature-selected model in terms of AIC, the feature-selected model is more interpretable and avoids variables with data quality issues, high collinearity, or unclear relationships to the response. These variables may prove valuable in our predictive model, but for interpretive purposes, we will use the feature-selected model as our final model.
+
+### Assumptions Check
+
+We assessed the key assumptions of logistic regression and found no meaningful violations. 
+
+To address nonlinearity in the numeric predictors, we applied a log transformation to both duration and campaign, and binned euribor3m into discrete categories, all of which showed skewed or nonlinear relationships in EDA. 
+
+Multicollinearity was addressed by excluding highly correlated economic variables such as emp.var.rate, cons.price.idx, and nr.employed, based on a correlation matrix check and VIF analysis. 
+
+We assume independence of observations based on the dataset's structure, where each row represents a unique client interaction, and outliers were managed through transformation rather than deletion. 
+
+## Interpretation
+
+### Call Duration (duration_log)
+
+As expected, call duration is a very strong predictor, but it is not useful for predictive modeling, as it cannot be known at prediction time. Intuitively, one would expect that a longer call would be associated with a higher likelihood of subscription, and this is confirmed by the model. The odds ratio of 1.23 indicates that for each additional second of call duration, the odds of subscribing increase by 23%. This is highly significant (p < 0.001), indicating a strong relationship.
+
+### Campaign Contact Frequency (campaign_bin)
+
+Compared to clients contacted once, those contacted 2–3 times have lower odds of subscribing (-0.16), and the effect for 4+ contacts is similar (-0.14) but statistically not significant (p-value 0.06).  This supports the idea that repeated contact may not improve — and may hurt — effectiveness.
+
+### Euribor 3-Month Rate (euribor_binned)
+
+Lower Euribor rates are associated with higher subscription rates. For example, clients contacted when the Euribor was <1% had significantly higher odds of subscribing compared to the 2% baseline (-0.55). 
+
+### Consumer Confidence Index (cons.conf.idx)
+
+Similar to Euribor, consumer confidence also shows a small positive relationship: as confidence increases, so does the probability of subscription. 
+
+### Contact Type (contact)
+
+Clients contacted via cellular are more likely to subscribe than those reached by telephone (-0.17), which is intuitive given the decreasing use of land lines over time. This data was from a paper published in 2014, so one could reasonably expect even less effectiveness of telephone contact today.
+
+### Month of Contact (month)
+
+The month of contact shows a significant effect. March has the highest positive effect (1.87), while May shows a significant negative effect (-0.62). Both predictors have a p-value of less than 0.001. Domain knowledge would suggest that people who were contacted multiple times (who are less likely to subscribe) were the ones most likely to be called at the end of the campaign. Intuitively, if you've been calling me since March, I am less likely to subscribe by May, and might even be a little annoyed.
+
+### Outcome of Previous Campaign Efforts (poutcome)
+
+Clients with a successful outcome in a previous campaign have significantly higher odds of subscribing again (2.02), while even those with no previous campaign (nonexistent) show a positive effect compared to the baseline (failure). The p-values for these predictors are less than 0.001, indicating a strong relationship. This suggests that prior successful engagement is a strong predictor of future subscription, and that clients who were not previously contacted are more likely to subscribe than those who had previously declined.
+
+### Job Type (job)
+
+As we expected from EDA, the job category has mixed effects. Students and retirees show higher odds of subscribing, while blue-collar workers show significantly lower odds.
+
+### Education Level (education)
+
+Education level also shows mixed effects. Only the university degree category shows a significant positive effect (0.28, p-value0.00866), suggesting limited differentiation among education levels.
+
+```{r}
+table(df$default)
+```
+
