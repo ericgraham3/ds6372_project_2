@@ -1,5 +1,5 @@
 ---
-title: "project_2_eda"
+title: "DS 6372 Project 2"
 author: "Blake Armstrong and Eric Graham"
 date: "`r Sys.Date()`"
 output: 
@@ -29,7 +29,8 @@ packages = c(
   "car",
   "lmboot",
   "glmnet",
-  "randomForest"
+  "randomForest",
+  "pROC"
 )
 invisible(lapply(packages, load_or_install))
 ```
@@ -83,7 +84,7 @@ This is contradictory: the poutcome values here imply that the client was previo
 ```{r}
 target_var = "y"
 
-num_vars = df %>% select(where(is.numeric)) %>% names()
+num_vars = df %>% dplyr::select(where(is.numeric)) %>% names()
 num_vars = setdiff(num_vars, target_var)
 
 cat_vars = setdiff(names(df), c(num_vars, target_var))
@@ -427,6 +428,24 @@ for (var in num_vars) {
 }
 ```
 
+```{r}
+df$y_numeric = as.numeric(df$y == "yes")
+for (var in num_vars) {
+  p = ggplot(df, aes(x = !!sym(var), y = y_numeric)) +
+    geom_point(alpha = 0.2, size = 0.8) +
+    geom_smooth(method = "loess", se = FALSE, color = "steelblue", linewidth = 1) +
+    labs(
+      x = get_label(var),
+      y = "Probability of Subscription",
+      title = paste("Subscription Probability vs", get_label(var))
+    ) +
+    theme_minimal()
+  print(p)
+}
+
+```
+
+
 </details>
 
 We note little difference between the median ages on the two subscription outcomes, leading us to think it might be a weak predictor. Likewise, number of employees (previously noted as having low variance) appears to be a weak predictor.
@@ -473,7 +492,7 @@ As noted previously, the default variable has very few "yes" values, and the hou
 ### Multicollinearity Check
 
 ```{r}
-cor_data = df %>% select(all_of(num_vars))
+cor_data = df %>% dplyr::select(all_of(num_vars))
 
 cor_matrix = cor(cor_data, use = "complete.obs")
 
@@ -502,6 +521,8 @@ vif(eda_vif_model)
 
 A VIF analysis confirms that the employment variation rate, consumer price index, and Euribor 3-Month Rate have high VIF values, indicating multicollinearity. 
 
+
+
 # 3: Interpretive Model
 
 ## Data Preparation
@@ -524,11 +545,6 @@ Euribor 3-Month Rate is highly collinear with employment variation rate and cons
 There is a decision to make as to whether we prefer the binned or continuous version of euribor3m. The relationship between the binned version and the response variable is clearer in the EDA, and more interpetable, so we will use it in the interpretive model, but the numeric version may be more appropriate for the predictive model.
 
 Given the data quality issues surrounding the original pdays variable, and its redundancy with poutcome, we will not include it in the model. Instead, we will use poutcome, which offers more detailed information about prior marketing attempts without the data quality issues. We will not include the raw or binned version of previous contacts to avoid overlap, since poutcome is more informative and interpretable.
-
-```{r}
-num_vars
-# cat_vars
-```
 
 ## Baseline Model (All Predictors, No Transformations)
 
@@ -577,7 +593,7 @@ summary(model_campaign_log)
 
 ### Binned Transformation for Campaign
 
-```{r, options(scipen = 999)}
+```{r}
 model_campaign_bin = glm(
   y ~ duration_log + campaign_bin + cons.conf.idx + euribor_binned +
       contact + month + poutcome + job + education,
@@ -587,29 +603,6 @@ model_campaign_bin = glm(
 summary(model_campaign_bin)
 ```
 
-### Try without macro
-
-```{r, options(scipen = 999)}
-model_campaign_bin_nomacro = glm(
-  y ~ duration_log + campaign_bin + 
-      contact + month + poutcome + job + education,
-  data = train_df,
-  family = binomial
-)
-summary(model_campaign_bin_nomacro)
-```
-
-### Try without duration
-
-```{r, options(scipen = 999)}
-model_campaign_noduration = glm(
-  y ~ campaign_bin + 
-      contact + month + poutcome + job + education,
-  data = train_df,
-  family = binomial
-)
-summary(model_campaign_noduration)
-```
 
 ### Comparison
 
@@ -676,7 +669,464 @@ As we expected from EDA, the job category has mixed effects. Students and retire
 
 Education level also shows mixed effects. Only the university degree category shows a significant positive effect (0.28, p-value0.00866), suggesting limited differentiation among education levels.
 
+# 4: Predictive Model 1 (Complex Logistic Regression)
+
+## Data Preparation
+
+### Important Note re: duration and pdays 
+
+As noted previously, we don't consider call duration to be a valid predictor of subscription, since it's a variable that wouldn't be known at the time of contact. 
+
+We are also proceeding with caution in our use of the pdays variable, given the previously-noted data quality issues. We will not include it in the predictive model, but we will include a boolean variable indicating whether the pdays value was missing (999). This will allow us to capture the effect of not having a previous contact without relying on the potentially problematic pdays variable itself.
+
 ```{r}
-table(df$default)
+set.seed(1234)
+
+selected_features <- c(
+  "age",
+  "job",
+  "marital",
+  "education",
+  "default",
+  "housing",
+  "loan",
+  "contact",
+  "month",
+  "day_of_week",
+  # "pdays",
+  "poutcome",
+  "emp.var.rate",
+  "cons.price.idx",
+  "cons.conf.idx",
+  "nr.employed",
+  "pdays_missing",
+  # "poutcome_missing",
+  "campaign_bin",
+  "prev_contacts_binned",
+  "euribor_binned",
+  "y_numeric"
+)
+
+df_clr_filtered <- df[, selected_features]
+
+train_proportion <- 0.7
+train_indices <- sample(seq_len(nrow(df_clr_filtered)), size = floor(train_proportion * nrow(df_clr_filtered)))
+
+train_df <- df_clr_filtered[train_indices, ]
+test_df  <- df_clr_filtered[-train_indices, ]
+
+names(train_df)
 ```
 
+## Feature Selection with LASSO
+
+As we look to extend our model for predictive puroses, we will begin with LASSO regression to select features. LASSO is particularly useful for high-dimensional datasets, as it performs both variable selection and regularization to enhance prediction accuracy and interpretability.
+
+```{r}
+X = model.matrix(y_numeric ~ . - 1, data = train_df)
+y = train_df$y_numeric
+
+cvfit_lasso = cv.glmnet(X, y, family = "binomial", alpha = 1)
+plot(cvfit_lasso)
+coef(cvfit_lasso, s = "lambda.min")
+
+cvfit_enet = cv.glmnet(X, y, family = "binomial", alpha = 0.5)
+plot(cvfit_enet)
+coef(cvfit_enet, s = "lambda.min")
+```
+
+## Polynomial Transformations and Interaction Terms
+
+1. Age: Scatterplots with LOESS smoothing show a nonlinear (U-shaped) relationship between age and the probability of subscription. This suggests that a quadratic transformation (age + age²) may improve model fit by capturing this curved relationship.
+
+2. Consumer Confidence Index (cons.conf.idx): This variable also shows a nonlinear relationship with respect to subscription likelihood. The "w-shaped" plot suggests that a fourth degree polynomial transformation may be appropriate to account for this curvature.
+
+3. euribor_binned * month: The Euribor 3-month rate captures economic conditions at the time of contact, and subscription likelihood varies substantially by month. Including an interaction between euribor_binned and month allows the model to account for possible seasonal effects of macroeconomic conditions.
+
+4. education * job: These two categorical variables both represent aspects of a client’s socioeconomic profile. While we had hoped that this interaction would capture the relationship between education and job type, the wide variety of job titles in the dataset makes this interaction too complex to be useful. We will not include this interaction in the final model.
+
+```{r}
+train_df$age_sq = train_df$age^2
+
+poly_cons_conf = poly(train_df$cons.conf.idx, degree = 4, raw = TRUE)
+colnames(poly_cons_conf) = paste0("cci_poly", 1:4)
+train_df = cbind(train_df, poly_cons_conf)
+
+X_complex = model.matrix(y_numeric ~ . + age_sq + 
+                         cci_poly1 + cci_poly2 + cci_poly3 + cci_poly4 + 
+                         euribor_binned:month - 1, data = train_df)
+
+y = train_df$y_numeric
+
+cvfit_complex = cv.glmnet(X_complex, y, family = "binomial", alpha = 1)
+plot(cvfit_complex)
+coef(cvfit_complex, s = "lambda.min")
+```
+
+## Model Evaluation
+
+```{r}
+test_df$age_sq = test_df$age^2
+
+poly_cons_conf_test = poly(test_df$cons.conf.idx, degree = 4, raw = TRUE)
+colnames(poly_cons_conf_test) = paste0("cci_poly", 1:4)
+test_df = cbind(test_df, poly_cons_conf_test)
+
+X_test = model.matrix(y_numeric ~ . + age_sq + 
+                      cci_poly1 + cci_poly2 + cci_poly3 + cci_poly4 + 
+                      euribor_binned:month - 1, data = test_df)
+
+probs = predict(cvfit_complex, newx = X_test, type = "response", s = "lambda.min")
+true = test_df$y_numeric
+
+threshold = 0.5
+preds = ifelse(probs >= threshold, 1, 0)
+
+conf = confusionMatrix(as.factor(preds), as.factor(true), positive = "1")
+
+sensitivity = conf$byClass["Sensitivity"]
+specificity = conf$byClass["Specificity"]
+ppv = conf$byClass["Pos Pred Value"]
+npv = conf$byClass["Neg Pred Value"]
+prevalence = mean(true)
+
+clr_roc_obj = roc(true, as.numeric(probs))
+auroc = auc(clr_roc_obj)
+
+clr_results = list(
+  Sensitivity = sensitivity,
+  Specificity = specificity,
+  PPV = ppv,
+  NPV = npv,
+  Prevalence = prevalence,
+  AUROC = auroc
+)
+print(clr_results)
+```
+
+## Model Performance Summary
+
+| Metric          | Value     | Interpretation                                                               |
+|-----------------|-----------|------------------------------------------------------------------------------|
+| **Sensitivity** | 0.2373    | Model only caught ~24% of actual positive cases (true yes)                   |
+| **Specificity** | 0.9856    | Model correctly ruled out ~99% of negative cases (true no)                   |
+| **PPV**         | 0.6776    | 67.8% of predicted “yes” were actually correct                               |
+| **NPV**         | 0.9101    | 91.0% of predicted “no” were actually correct                                |
+| **Prevalence**  | 0.1132    | Only ~11% of observations are actual “yes” (class imbalance is common here)  |
+| **AUROC**       | 0.7919    |                                                                              |
+
+# 5: Predictive Model 2 (Linear Deterministic Analysis)
+
+## Data Preparation
+
+```{r}
+link <- "https://raw.githubusercontent.com/tblakearmstrong/SMU-MSDS/refs/heads/main/Stats%206372/Project%202/bank-full.csv"
+link2 <- "https://raw.githubusercontent.com/tblakearmstrong/SMU-MSDS/refs/heads/main/Stats%206372/Project%202/bank-additional-full.csv"
+bank <- read.csv(link2, header =TRUE, sep=";")  #Pulling in the additional full currently
+bank <- bank %>% 
+  #dplyr::select(-response_num) %>% 
+  dplyr::mutate(log_duration = log(duration+1))
+bank$y = factor(bank$y, levels = c("no", "yes"))
+```
+
+## EDA for LDA/QDA Assumptions
+
+```{r}
+pairs(bank[, c("age", "duration")], col = as.numeric(factor(bank$y)))
+
+ggplot(bank, aes(x=duration, fill=y)) + 
+    geom_density(alpha=0.5) + theme_minimal()
+```
+
+```{r lda_model, echo=F, message=F, warning=F}
+library(MASS)
+library(caret)
+library(pROC)
+library(dplyr)
+library(corrplot)
+library(GGally)
+
+set.seed(123)
+
+lda_data <- bank %>%
+  dplyr::select(-duration, -emp.var.rate, -pdays, -log_duration)
+
+#Scale numeric predictors to handle high dimensionality and ensure comparability
+lda_numeric_cols <- lda_data %>% dplyr::select(where(is.numeric))
+lda_scaled_numeric <- as.data.frame(scale(lda_numeric_cols))
+lda_bank_scaled <- bind_cols(lda_scaled_numeric, y = bank$y)
+
+#Check Correlations since they have to be MVN and not correlated, there are not any MVN with good separation in this dataset, LDA is likely not appropriate to use here.
+#ggpairs(lda_bank_scaled, aes(color=y))
+corrplot(cor(lda_scaled_numeric), method = "color", tl.cex = 0.7)
+
+#Model
+fitControl<-trainControl(method="repeatedcv",number=5,repeats=1,classProbs=TRUE, summaryFunction=twoClassSummary)
+
+#LDA less highly correlated factors and duration
+lda.fit<-train(y~ age + campaign + euribor3m,
+               data=lda_bank_scaled,
+               method="lda",
+               trControl=fitControl,
+               metric="ROC")
+summary(lda.fit)
+lda.fit
+
+
+#Computing predicted probabilities on the training data
+lda.predictions <- predict(lda.fit, newdata = lda_bank_scaled, type = "prob")[,"yes"]
+
+#AUROC Curve
+lda_roc_obj <- roc(lda_bank_scaled$y, lda.predictions, levels = c("no", "yes"))
+plot(lda_roc_obj)
+
+#Best threshold (Youden’s J index)
+coords(lda_roc_obj, "best", ret = "threshold")
+threshold <- coords(lda_roc_obj, "best", ret = "threshold")[[1]]
+
+#Confusion Matrix
+lda_predicted_class <- factor(ifelse(lda.predictions > threshold, "yes", "no"), levels = c("yes", "no"))
+confusionMatrix(lda_predicted_class, lda_bank_scaled$y, positive = "yes")
+```
+
+
+# 6: Predictive Model 3 (Quadratic Deterministic Analysis)
+
+```{r qda_model, echo=F, message=F, warning=F}
+library(MASS)
+library(caret)
+library(pROC)
+library(dplyr)
+library(corrplot)
+library(GGally)
+
+set.seed(123)
+
+qda_data <- bank %>%
+  dplyr::select(-duration, -emp.var.rate, -pdays, -log_duration)
+
+#Scale numeric predictors to handle high dimensionality and ensure comparability
+qda_numeric_cols <- qda_data %>% dplyr::select(where(is.numeric))
+qda_scaled_numeric <- as.data.frame(scale(qda_numeric_cols))
+qda_bank_scaled <- bind_cols(qda_scaled_numeric, y = bank$y)
+
+#Model
+fitControl<-trainControl(method="repeatedcv",number=5,repeats=1,classProbs=TRUE, summaryFunction=twoClassSummary)
+
+#QDA, no variables really meet the criteria of multivariate normal, but the three included in lda are the closest, continue with same in QDA
+qda.fit<-train(y ~ age + campaign + euribor3m,
+               data=qda_bank_scaled,
+               method="qda",
+               trControl=fitControl,
+               metric="ROC")
+summary(qda.fit)
+qda.fit
+
+#Computing predicted probabilities on the training data
+qda.predictions <- predict(qda.fit, newdata = qda_bank_scaled, type = "prob")[,"yes"]
+
+#AUROC Curve
+qda_roc_obj <- roc(qda_bank_scaled$y, qda.predictions, levels = c("no", "yes"))
+plot(qda_roc_obj)
+
+#Best threshold (Youden’s J index)
+coords(qda_roc_obj, "best", ret = "threshold")
+threshold <- coords(qda_roc_obj, "best", ret = "threshold")[[1]]
+
+#Confusion Matrix
+qda_predicted_class <- factor(ifelse(qda.predictions > threshold, "yes", "no"), levels = c("yes", "no"))
+confusionMatrix(qda_predicted_class, qda_bank_scaled$y, positive = "yes")
+```
+
+# 7: Predictive Model 4 (Non-Parametric Model)
+
+```{r non-parametric, echo = FALSE, warning = FALSE, message = FALSE} 
+library(randomForest)
+library(tidyverse)
+library(caret)
+library(dplyr)
+library(pROC)
+
+set.seed(123)
+
+#Reset data table
+rf_bank <- read.csv(link2, header =TRUE, sep=";")
+rf_bank <- rf_bank %>% dplyr::select(-duration) %>%  mutate(across(where(is.character), as.factor))
+
+#Train Control
+fitControl <- trainControl(method = "repeatedcv", number = 5, repeats = 1, classProbs = TRUE, summaryFunction = twoClassSummary)
+
+#Model
+rf.fit <- train(y ~ ., data = rf_bank, 
+                method = "rf", 
+                trControl = fitControl, 
+                metric = "ROC",
+                ntree=100)
+summary(rf.fit)
+rf.fit
+var_imp <- varImp(rf.fit)
+plot(var_imp, top = 20, main = "Variable Importance")
+
+#Predict probabilities (on validation set)
+rf.predictions <- predict(rf.fit, rf_bank, type = "prob")[,"yes"]
+
+
+#AUROC Curve
+rf_roc_obj <- roc(rf_bank$y, rf.predictions, levels = c("no", "yes"))
+plot(rf_roc_obj)
+
+#Best threshold (Youden’s J index)
+coords(rf_roc_obj, "best", ret = "threshold")
+threshold <- coords(rf_roc_obj, "best", ret = "threshold")[[1]]
+
+#Confusion Matrix
+rf_predicted_class <- factor(ifelse(rf.predictions > threshold, "yes", "no"), levels = c("yes", "no"))
+confusionMatrix(rf_predicted_class, rf_bank$y, positive = "yes")
+```
+
+# 8: Comparative Summary of Predictive Model Performance
+
+## Model Performance Interpretation
+
+In the context of predicting whether a customer will subscribe to a term deposit we consider several key metrics:
+
+* Sensitivity (True Positive Rate): The proportion of actual subscribers correctly identified by the model. High sensitivity means a model would perform better at identifying potential subscribers.
+* Specificity (True Negative Rate): The proportion of non-subscribers correctly identified. High specificity in a model would mean we would avoid targeting unlikely customers.
+* PPV (Positive Predictive Value): Of all customers predicted to subscribe, what proportion actually did. High PPV would mean that our predictions are reliable when we say "yes."
+* NPV (Negative Predictive Value): Of all customers predicted not to subscribe, the proportion who truly did not. High NPV would show that our model is reliable when saying "no."
+Prevalence & AUROC: Prevalence reflects how common it is for customers to subscribe overall (typically low in this dataset), which can affect interpretation of PPV and NPV. AUROC (Area Under the ROC Curve) summarizes how well the model separates subscribers from non-subscribers across all thresholds—a higher AUROC means better overall discrimination.
+
+### Model Performance Priorities
+
+Since a phone marketing campaign has real costs, PPV is crucial: these marketing expenses are best used to target customers who are truly likely to subscribe. However, sensitivity is also important if we don't want to miss potential customers. Our recommendation would be to choose models that prioritize PPV and sensitivity, with specificity and NPV being less important.
+
+## ROC Curves
+
+```{r all_combined_roc, message = F, warning = F}
+library(pROC)
+#plot(roc_obj, col = "blue")
+plot(clr_roc_obj, col = "blue", lwd = 2)
+lines(lda_roc_obj, col = "green")
+lines(qda_roc_obj, col = "red")
+lines(rf_roc_obj, col = "purple")
+
+legend("bottomright", 
+       legend = c("Multiple Logistic - Complex", "LDA", "QDA", "Random Forest"),
+       col = c("blue", "green", "red", "purple"),
+       lwd = 2)
+```
+
+## Summary Table of Comparative Metrics
+
+| Model                 | Sensitivity | Specificity | PPV    | NPV    | Prevalence | AUROC  |
+|----------------------|-------------|-------------|--------|--------|------------|--------|
+| Complex Logistic (CLR)| 0.2373      | 0.9856      | 0.6776 | 0.9101 | 0.1132     | 0.7919 |
+| LDA                  | 0.7116      | 0.7210      | 0.2446 | 0.9517 | 0.1127     | 0.7468 |
+| QDA                  | 0.6970      | 0.7394      | 0.2534 | 0.9505 | 0.1127     | 0.7509 |
+| Random Forest        | 0.9901      | 0.9882      | 0.9144 | 0.9987 | 0.1127     | 0.9993 |
+
+### CLR Metrics
+
+```{r}
+clr_conf = confusionMatrix(as.factor(preds), as.factor(true), positive = "1")
+
+sensitivity = clr_conf$byClass["Sensitivity"]
+specificity = clr_conf$byClass["Specificity"]
+ppv = clr_conf$byClass["Pos Pred Value"]
+npv = clr_conf$byClass["Neg Pred Value"]
+prevalence = mean(true)
+
+clr_roc_obj = roc(true, as.numeric(probs))
+auroc = auc(clr_roc_obj)
+
+clr_results = list(
+  Sensitivity = sensitivity,
+  Specificity = specificity,
+  PPV = ppv,
+  NPV = npv,
+  Prevalence = prevalence,
+  AUROC = auroc
+)
+print(clr_results)
+```
+
+
+### LDA Metrics
+
+```{r}
+lda_conf = confusionMatrix(lda_predicted_class, lda_bank_scaled$y, positive = "yes")
+
+lda_sensitivity = lda_conf$byClass["Sensitivity"]
+lda_specificity = lda_conf$byClass["Specificity"]
+lda_ppv = lda_conf$byClass["Pos Pred Value"]
+lda_npv = lda_conf$byClass["Neg Pred Value"]
+lda_prevalence = mean(lda_bank_scaled$y == "yes")
+lda_auroc = auc(lda_roc_obj)
+
+lda_results = list(
+  Sensitivity = lda_sensitivity,
+  Specificity = lda_specificity,
+  PPV = lda_ppv,
+  NPV = lda_npv,
+  Prevalence = lda_prevalence,
+  AUROC = lda_auroc
+)
+
+print(lda_results)
+```
+
+### QDA Metrics
+
+```{r}
+qda_conf = confusionMatrix(qda_predicted_class, qda_bank_scaled$y, positive = "yes")
+
+qda_sensitivity = qda_conf$byClass["Sensitivity"]
+qda_specificity = qda_conf$byClass["Specificity"]
+qda_ppv = qda_conf$byClass["Pos Pred Value"]
+qda_npv = qda_conf$byClass["Neg Pred Value"]
+qda_prevalence = mean(qda_bank_scaled$y == "yes")
+qda_auroc = auc(qda_roc_obj)
+
+qda_results = list(
+  Sensitivity = qda_sensitivity,
+  Specificity = qda_specificity,
+  PPV = qda_ppv,
+  NPV = qda_npv,
+  Prevalence = qda_prevalence,
+  AUROC = qda_auroc
+)
+
+print(qda_results)
+
+```
+
+### Random Forest Metrics
+
+```{r}
+rf_conf = confusionMatrix(rf_predicted_class, rf_bank$y, positive = "yes")
+
+rf_sensitivity = rf_conf$byClass["Sensitivity"]
+rf_specificity = rf_conf$byClass["Specificity"]
+rf_ppv = rf_conf$byClass["Pos Pred Value"]
+rf_npv = rf_conf$byClass["Neg Pred Value"]
+rf_prevalence = mean(rf_bank$y == "yes")
+rf_auroc = auc(rf_roc_obj)
+
+rf_results = list(
+  Sensitivity = rf_sensitivity,
+  Specificity = rf_specificity,
+  PPV = rf_ppv,
+  NPV = rf_npv,
+  Prevalence = rf_prevalence,
+  AUROC = rf_auroc
+)
+
+print(rf_results)
+```
+
+# Appendix: Data Sources
+
+Data Source Citation: 
+
+  [Moro et al., 2011] S. Moro, R. Laureano and P. Cortez. Using Data Mining for Bank Direct Marketing: An Application of the CRISP-DM Methodology. 
+  In P. Novais et al. (Eds.), Proceedings of the European Simulation and Modelling Conference - ESM'2011, pp. 117-121, Guimarães, Portugal, October, 2011. EUROSIS.
