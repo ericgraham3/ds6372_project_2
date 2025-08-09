@@ -199,6 +199,7 @@ We see the overwhelming number of clients did not subscribe to a term deposit, w
 ```{r}
 p = ggplot(df, aes(x = y)) +
   geom_bar(fill = "steelblue", color = "white") +
+  geom_text(stat = "count", aes(label = ..count..), vjust = -0.5) +
   labs(
     x = "Subscribed",
     y = "Count",
@@ -532,6 +533,7 @@ set.seed(1234)
 train_proportion = 0.7
 train_indices = sample(1:nrow(df), size = floor(train_proportion * nrow(df)))
 train_df = df[train_indices, ]
+test_df = df[-train_indices, ]
 ```
 
 ## Feature Selection Considerations
@@ -601,6 +603,43 @@ model_campaign_bin = glm(
   family = binomial
 )
 summary(model_campaign_bin)
+
+ctrl = caret::trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = caret::twoClassSummary, savePredictions = "final", allowParallel = FALSE, verboseIter = TRUE)
+slr_cv = caret::train(
+  y ~ duration_log + campaign_bin + cons.conf.idx + euribor_binned +
+      contact + month + poutcome + job + education,
+  data = train_df,
+  method = "glm",
+  family = binomial,
+  metric = "ROC",
+  trControl = ctrl
+)
+
+probs = predict(model_campaign_bin, newdata = test_df, type = "response")
+threshold = 0.5
+preds = ifelse(probs >= threshold, "yes", "no")
+preds = factor(preds, levels = levels(test_df$y))
+conf = caret::confusionMatrix(preds, test_df$y, positive = "yes")
+
+sensitivity = conf$byClass["Sensitivity"]
+specificity = conf$byClass["Specificity"]
+ppv = conf$byClass["Pos Pred Value"]
+npv = conf$byClass["Neg Pred Value"]
+prevalence = mean(test_df$y == "yes")
+
+clr_roc_obj = pROC::roc(response = test_df$y, predictor = as.numeric(probs), levels = c("no", "yes"))
+auroc = pROC::auc(clr_roc_obj)
+
+slr_results = list(
+  Sensitivity = sensitivity,
+  Specificity = specificity,
+  PPV = ppv,
+  NPV = npv,
+  Prevalence = prevalence,
+  AUROC = auroc
+)
+print(slr_results)
+
 ```
 
 
@@ -635,7 +674,9 @@ We assume independence of observations based on the dataset's structure, where e
 
 ### Call Duration (duration_log)
 
-As expected, call duration is a very strong predictor, but it is not useful for predictive modeling, as it cannot be known at prediction time. Intuitively, one would expect that a longer call would be associated with a higher likelihood of subscription, and this is confirmed by the model. The odds ratio of 1.23 indicates that for each additional second of call duration, the odds of subscribing increase by 23%. This is highly significant (p < 0.001), indicating a strong relationship.
+As expected, call duration is a very strong predictor, but it is not useful for predictive modeling, as it cannot be known at prediction time. Intuitively, one would expect that a longer call would be associated with a higher likelihood of subscription, and this is confirmed by the model. 
+
+The odds ratio of 1.23 indicates that for a one-unit increase in log(duration + 1), which is approximately a 2.72-fold increase in the original call duration, the odds of subscribing increase by 23%. This relationship is highly significant (p < 0.001), indicating a strong positive relationship between call length and subscription likelihood.
 
 ### Campaign Contact Frequency (campaign_bin)
 
@@ -643,19 +684,23 @@ Compared to clients contacted once, those contacted 2–3 times have lower odds 
 
 ### Euribor 3-Month Rate (euribor_binned)
 
-Lower Euribor rates are associated with higher subscription rates. For example, clients contacted when the Euribor was <1% had significantly higher odds of subscribing compared to the 2% baseline (-0.55). 
+Lower Euribor rates are associated with higher subscription rates. Using <1 as the reference category, customers with an Euribor 3-month rate in bin 1 have odds of subscribing that are about 42% lower (OR ≈ 0.58) than those in the <1 bin, a difference that is statistically significant (p < 0.001).
 
 ### Consumer Confidence Index (cons.conf.idx)
 
-Similar to Euribor, consumer confidence also shows a small positive relationship: as confidence increases, so does the probability of subscription. 
+Similar to Euribor, consumer confidence also shows a small positive relationship: the coefficient for consumer confidence index is 0.031 (OR ≈ 1.03), meaning that for each one-point increase in the index, the odds of a customer subscribing to a term deposit increase by about 3%. This effect is statistically significant (p < 0.001).
 
 ### Contact Type (contact)
 
-Clients contacted via cellular are more likely to subscribe than those reached by telephone (-0.17), which is intuitive given the decreasing use of land lines over time. This data was from a paper published in 2014, so one could reasonably expect even less effectiveness of telephone contact today.
+Using cellular as the reference category, customers contacted by telephone have odds of subscribing that are about 16% lower (OR ≈ 0.84). This difference is statistically significant (p ≈ 0.042). This data was from a paper published in 2014, so one could reasonably expect even less effectiveness of telephone contact today.
 
 ### Month of Contact (month)
 
-The month of contact shows a significant effect. March has the highest positive effect (1.87), while May shows a significant negative effect (-0.62). Both predictors have a p-value of less than 0.001. Domain knowledge would suggest that people who were contacted multiple times (who are less likely to subscribe) were the ones most likely to be called at the end of the campaign. Intuitively, if you've been calling me since March, I am less likely to subscribe by May, and might even be a little annoyed.
+Compared to April, the odds of a customer subscribing are significantly higher in most months, with the largest effect in March—odds are over six times greater (OR ≈ 6.51, p < 0.001). June (OR ≈ 2.15), October (OR ≈ 1.95), November (OR ≈ 1.85), July (OR ≈ 1.76), September (OR ≈ 1.45), and August (OR ≈ 1.42) also show significantly higher odds.
+
+In contrast, May shows significantly lower odds of subscription (OR ≈ 0.54, p < 0.001).
+
+December shows higher odds (OR ≈ 1.58), but the effect is not statistically significant at the 0.05 level (p ≈ 0.078).
 
 ### Outcome of Previous Campaign Efforts (poutcome)
 
@@ -1018,12 +1063,13 @@ legend("bottomright",
 
 ## Summary Table of Comparative Metrics
 
-| Model                 | Sensitivity | Specificity | PPV    | NPV    | Prevalence | AUROC  |
-|----------------------|-------------|-------------|--------|--------|------------|--------|
-| Complex Logistic (CLR)| 0.2373      | 0.9856      | 0.6776 | 0.9101 | 0.1132     | 0.7919 |
-| LDA                  | 0.7116      | 0.7210      | 0.2446 | 0.9517 | 0.1127     | 0.7468 |
-| QDA                  | 0.6970      | 0.7394      | 0.2534 | 0.9505 | 0.1127     | 0.7509 |
-| Random Forest        | 0.9901      | 0.9882      | 0.9144 | 0.9987 | 0.1127     | 0.9993 |
+| Model                  | Sensitivity | Specificity | PPV     | NPV     | Prevalence | AUROC  |
+|------------------------|-------------|-------------|---------|---------|------------|--------|
+| Interpretive Model     | 0.4132      | 0.9704      | 0.6408  | 0.9283  | 0.1132     | 0.9310 |
+| Complex Logistic (CLR) | 0.2373      | 0.9856      | 0.6776  | 0.9101  | 0.1132     | 0.7919 |
+| LDA                    | 0.7116      | 0.7210      | 0.2446  | 0.9517  | 0.1127     | 0.7468 |
+| QDA                    | 0.6970      | 0.7394      | 0.2534  | 0.9505  | 0.1127     | 0.7509 |
+| Random Forest          | 0.9901      | 0.9882      | 0.9144  | 0.9987  | 0.1127     | 0.9993 |
 
 ### CLR Metrics
 
